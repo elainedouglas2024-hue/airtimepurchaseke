@@ -134,9 +134,11 @@ app.post("/purchase", async (req, res) => {
   if (!phone_number || !amount) {
     return res.status(400).json({ success: false, message: "phone_number and amount required" });
   }
-  if (phone_number.startsWith("07")) {
-    phone_number = "254" + phone_number.slice(1);
-  }
+  // Normalize phone format: if starts with 0, replace with 254
+if (phone_number.startsWith("0")) {
+  phone_number = "254" + phone_number.slice(1);
+}
+// if user already enters with 254… keep as is
 
   try {
     const init = await axios.post(
