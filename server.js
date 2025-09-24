@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // ====== NOTE ======
 // For testing we allow all origins. Change to a restricted list in production.
 app.use(express.json());
-app.use(cors()); // TODO: restrict origin(s) in production
+app.use(cors({ origin: "https://stellar-caramel-01893d.netlify.app" }));
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
