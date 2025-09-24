@@ -261,7 +261,7 @@ logToFile("callback_airtime_result.log", { ref, ok, result });
 
 entry.airtime = ok ? "success" : "failed";
 pending.set(ref, entry);
-setTimeout(() => pending.delete(ref), 60000);
+setTimeout(() => pending.delete(ref), 600000);
     } else if (["failed", "cancelled"].includes(normalized)) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
