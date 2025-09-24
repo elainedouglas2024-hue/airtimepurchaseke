@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // ====== NOTE ======
 // For testing we allow all origins. Change to a restricted list in production.
 app.use(express.json());
-app.use(cors({ origin: "https://stellar-caramel-01893d.netlify.app" }));
+app.use(cors({ origin: "https://enchanting-flan-227e80.netlify.app" }));
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -239,7 +239,12 @@ app.post("/purchase", async (req, res) => {
       logToFile("pending_added.log", { transaction_reference, entry });
     }
 
-    return res.json({ success: true, message: "STK push initiated", data: init.data?.data || init.data });
+    return res.json({
+  success: true,
+  message: "STK push initiated",
+  reference: transaction_reference,   // 👈 always include this
+  data: init.data?.data || init.data
+});
   } catch (err) {
     const errorData = err?.response?.data || err?.message || err;
     console.error("❌ PayNecta init error:", errorData);
