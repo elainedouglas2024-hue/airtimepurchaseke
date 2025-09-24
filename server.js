@@ -1,4 +1,4 @@
-// server.js (Statum-first receipts + Paycenta status)
+// server.js (Statum-first receipts + Paycenta status + Retry Queue)
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -27,6 +27,38 @@ const AUTO_CLEAN_MS = 10 * 60 * 1000;
 if (!fs.existsSync("logs")) fs.mkdirSync("logs");
 
 const pending = new Map();
+const retryQueue = [];
+
+// retry loop every 1 minute
+setInterval(async () => {
+  if (retryQueue.length === 0) return;
+  console.log("🔄 Retrying failed airtime queue:", retryQueue.length);
+
+  const job = retryQueue.shift();
+  const { phone, amount, ref } = job;
+
+  const { ok, result, retry } = await sendAirtime(phone, amount, ref);
+  if (ok) {
+    console.log(`✅ Retry succeeded for ${ref}`);
+    if (pending.has(ref)) {
+      const entry = pending.get(ref);
+      entry.airtime = "success";
+      entry.statumResult = result;
+      pending.set(ref, entry);
+    }
+  } else if (retry) {
+    console.log(`⚠️ Float still low for ${ref}, requeueing`);
+    retryQueue.push(job);
+  } else {
+    console.log(`❌ Retry failed permanently for ${ref}`);
+    if (pending.has(ref)) {
+      const entry = pending.get(ref);
+      entry.airtime = "failed";
+      entry.statumResult = result;
+      pending.set(ref, entry);
+    }
+  }
+}, 60 * 1000);
 
 // === helpers ===
 function logToFile(filename, data) {
@@ -72,6 +104,14 @@ async function sendAirtime(phoneNumber, amount, reference) {
       (result?.status_code && Number(result.status_code) === 200) ||
       result?.success === true;
 
+    const insufficientFloat =
+      result?.description?.toLowerCase().includes("insufficient") ||
+      result?.message?.toLowerCase().includes("balance");
+
+    if (insufficientFloat) {
+      return { ok: false, result, retry: true };
+    }
+
     return { ok, result };
   } catch (err) {
     console.error("❌ Statum call error:", err?.message || err);
@@ -96,18 +136,26 @@ async function pollTransaction(ref) {
 
     entry.attempts = (entry.attempts || 0) + 1;
     entry.status = normalized;
-    entry.paycentaResult = payStatus; // ✅ store full Paycenta response
+    entry.paycentaResult = payStatus;
 
     if (normalized === "success" && !entry.processed) {
       entry.processed = true;
       clearInterval(entry.intervalId);
 
       // call Statum
-      const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
-      entry.airtime = ok ? "success" : "failed";
-      entry.statumResult = result;
+      const { ok, result, retry } = await sendAirtime(entry.mobile, entry.amount, ref);
 
-      pending.set(ref, entry);
+      if (retry) {
+        entry.airtime = "failed";
+        entry.statumResult = result;
+        pending.set(ref, entry);
+        retryQueue.push({ phone: entry.mobile, amount: entry.amount, ref });
+      } else {
+        entry.airtime = ok ? "success" : "failed";
+        entry.statumResult = result;
+        pending.set(ref, entry);
+      }
+
       setTimeout(() => pending.delete(ref), AUTO_CLEAN_MS);
     }
 
@@ -134,11 +182,9 @@ app.post("/purchase", async (req, res) => {
   if (!phone_number || !amount) {
     return res.status(400).json({ success: false, message: "phone_number and amount required" });
   }
-  // Normalize phone format: if starts with 0, replace with 254
-if (phone_number.startsWith("0")) {
-  phone_number = "254" + phone_number.slice(1);
-}
-// if user already enters with 254… keep as is
+  if (phone_number.startsWith("0")) {
+    phone_number = "254" + phone_number.slice(1);
+  }
 
   try {
     const init = await axios.post(
