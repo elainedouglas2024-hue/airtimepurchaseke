@@ -217,7 +217,12 @@ app.post("/purchase", async (req, res) => {
 
     if (!transaction_reference) {
       // Soft success — STK may still be sent
-      return res.json({ success: true, message: "STK push initiated (no reference returned)", data: init.data });
+      return res.json({
+  success: true,
+  message: "STK push initiated",
+  reference: transaction_reference,   // 👈 always add this
+  data: init.data?.data || init.data
+});
     }
 
     // create pending entry and start poller
