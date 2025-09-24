@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 // ✅ Fixed CORS to allow local development and production
 const allowedOrigins = [
-  "https://timely-speculoos-674fbf.netlify.app",
+  "https://regal-faloodeh-d5655c.netlify.app",
   "http://localhost:5000",
   /^https:\/\/.*\.replit\.app$/,
   /^https:\/\/.*\.replit\.dev$/
