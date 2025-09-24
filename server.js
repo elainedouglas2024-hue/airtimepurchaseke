@@ -1,4 +1,4 @@
-// server.js
+// server.js (patched)
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -8,8 +8,10 @@ import fs from "fs";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ====== NOTE ======
+// For testing we allow all origins. Change to a restricted list in production.
 app.use(express.json());
-app.use(cors({ origin: "https://purchaseairtime.netlify.app" })); // restrict in production
+app.use(cors()); // TODO: restrict origin(s) in production
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -19,15 +21,16 @@ const PAYMENT_LINK_CODE = "PNT_366813";
 const STATUM_KEY = "18885957c3a6cd14410aa9bfd7c16ba5273";
 const STATUM_SECRET = "sqPzmmybSXtQm7BJQIbz188vUR8P";
 
-// ===== Config for polling =====
+// ===== Config for polling / cleanup =====
 const POLL_INTERVAL_MS = 5000; // 5s
 const MAX_POLL_ATTEMPTS = 40;   // ~200s total (tweak as needed)
+const AUTO_CLEAN_MS = 10 * 60 * 1000; // keep pending records for 10 minutes
 
 // Create logs dir if missing
 if (!fs.existsSync("logs")) fs.mkdirSync("logs");
 
 // Simple in-memory tracker for pending transactions
-// Structure: reference => { mobile, amount, attempts, status, processed, intervalId, startedAt }
+// Structure: reference => { mobile, amount, attempts, status, processed, intervalId, airtime, startedAt }
 const pending = new Map();
 
 // === helpers ===
@@ -94,7 +97,7 @@ async function pollTransaction(ref) {
   // If already processed, stop
   if (entry.processed) {
     clearInterval(entry.intervalId);
-    pending.delete(ref);
+    // leave the entry in 'pending' for AUTO_CLEAN_MS (set elsewhere)
     return;
   }
 
@@ -123,37 +126,60 @@ async function pollTransaction(ref) {
 
       // call Statum
       const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
-logToFile("poll_airtime_result.log", { ref, ok, result });
+      logToFile("poll_airtime_result.log", { ref, ok, result });
 
-// ✅ save airtime status before removing
-entry.airtime = ok ? "success" : "failed";
+      // save airtime status before removing
+      entry.airtime = ok ? "success" : "failed";
+      entry.status = "success"; // payment succeeded
 
-// keep a record (could also archive instead of delete)
-pending.set(ref, entry);
-setTimeout(() => pending.delete(ref), 60000); // auto-clean after 1 min
+      // keep a record (archive for AUTO_CLEAN_MS)
+      pending.set(ref, entry);
+      setTimeout(() => {
+        pending.delete(ref);
+        logToFile("auto_clean.log", { ref, reason: "auto_clean_after_success" });
+      }, AUTO_CLEAN_MS);
+
       return;
     }
 
     if (["failed", "cancelled"].includes(normalized)) {
       // final negative state
       clearInterval(entry.intervalId);
-      pending.delete(ref);
+      entry.status = normalized;
+      entry.airtime = "failed";
+      pending.set(ref, entry);
       logToFile("paynecta_failure.log", { ref, status: normalized });
+
+      // keep record for some time so frontend can fetch
+      setTimeout(() => {
+        pending.delete(ref);
+        logToFile("auto_clean.log", { ref, reason: "auto_clean_after_failure" });
+      }, AUTO_CLEAN_MS);
+
       return;
     }
 
     // check max attempts
     if ((entry.attempts || 0) >= MAX_POLL_ATTEMPTS) {
       clearInterval(entry.intervalId);
-      pending.delete(ref);
+      entry.status = "pending";
+      pending.set(ref, entry);
       logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
+
+      // keep record so frontend can check later
+      setTimeout(() => {
+        pending.delete(ref);
+        logToFile("auto_clean.log", { ref, reason: "auto_clean_after_timeout" });
+      }, AUTO_CLEAN_MS);
+
       return;
     }
   } catch (err) {
     console.error("❌ Poll error for", ref, err?.response?.data || err?.message || err);
     logToFile("poll_error.log", { ref, error: err?.response?.data || err?.message || String(err) });
     entry.attempts = (entry.attempts || 0) + 1;
-    // continue until MAX_POLL_ATTEMPTS
+    pending.set(ref, entry);
+    // continue until MAX_POLL_ATTEMPTS; poll loop will handle attempts count
     if (entry.attempts >= MAX_POLL_ATTEMPTS) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
@@ -169,7 +195,7 @@ app.post("/purchase", async (req, res) => {
     return res.status(400).json({ success: false, message: "phone_number and amount required" });
   }
 
-  // ✅ Normalize phone format to 2547XXXXXXX
+  // Normalize phone format to 2547XXXXXXX
   if (phone_number.startsWith("07")) {
     phone_number = "254" + phone_number.slice(1);
   }
@@ -194,7 +220,7 @@ app.post("/purchase", async (req, res) => {
       return res.json({ success: true, message: "STK push initiated (no reference returned)", data: init.data });
     }
 
-    // ✅ create pending entry and start poller (unchanged)
+    // create pending entry and start poller
     if (!pending.has(transaction_reference)) {
       const entry = {
         mobile: phone_number,
@@ -203,6 +229,7 @@ app.post("/purchase", async (req, res) => {
         status: "pending",
         processed: false,
         intervalId: null,
+        airtime: "pending",
         startedAt: Date.now()
       };
       const intervalId = setInterval(() => pollTransaction(transaction_reference), POLL_INTERVAL_MS);
@@ -218,7 +245,7 @@ app.post("/purchase", async (req, res) => {
     console.error("❌ PayNecta init error:", errorData);
     logToFile("paynecta_init_error.log", { error: errorData });
 
-    // ✅ Instead of failing hard, respond with soft success
+    // Instead of failing hard, respond with soft success
     return res.json({
       success: true,
       message: "STK push may have been initiated — check your phone",
@@ -256,16 +283,29 @@ app.post("/paynecta/callback", async (req, res) => {
       entry.processed = true;
       clearInterval(entry.intervalId);
       // call Statum
-const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
-logToFile("callback_airtime_result.log", { ref, ok, result });
+      const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
+      logToFile("callback_airtime_result.log", { ref, ok, result });
 
-entry.airtime = ok ? "success" : "failed";
-pending.set(ref, entry);
-setTimeout(() => pending.delete(ref), 600000);
+      entry.airtime = ok ? "success" : "failed";
+      entry.status = "success";
+      pending.set(ref, entry);
+
+      // keep a record for AUTO_CLEAN_MS then delete
+      setTimeout(() => {
+        pending.delete(ref);
+        logToFile("auto_clean.log", { ref, reason: "callback_auto_clean" });
+      }, AUTO_CLEAN_MS);
     } else if (["failed", "cancelled"].includes(normalized)) {
       clearInterval(entry.intervalId);
-      pending.delete(ref);
+      entry.status = normalized;
+      entry.airtime = "failed";
+      pending.set(ref, entry);
       logToFile("callback_failure.log", { ref, status: normalized });
+
+      setTimeout(() => {
+        pending.delete(ref);
+        logToFile("auto_clean.log", { ref, reason: "callback_auto_clean_failure" });
+      }, AUTO_CLEAN_MS);
     } else {
       // pending - just update attempts/status
       pending.set(ref, entry);
@@ -277,9 +317,26 @@ setTimeout(() => pending.delete(ref), 600000);
       const logRef = ref || ("cb_" + Date.now());
       logToFile("callback_no_pending.log", { logRef, status: normalized, mobile, amount });
 
-      // send airtime anyway (be careful in production — prefer only after verifying transaction server-side)
+      // send airtime anyway
       const { ok, result } = await sendAirtime(mobile, amount, logRef);
       logToFile("callback_airtime_no_pending.log", { logRef, ok, result });
+
+      // create a short-lived pending-like entry so /api/status can return consistent data
+      const entry = {
+        mobile,
+        amount,
+        attempts: 0,
+        status: "success",
+        processed: true,
+        airtime: ok ? "success" : "failed",
+        startedAt: Date.now()
+      };
+      pending.set(logRef, entry);
+
+      setTimeout(() => {
+        pending.delete(logRef);
+        logToFile("auto_clean.log", { ref: logRef, reason: "callback_no_pending_auto_clean" });
+      }, AUTO_CLEAN_MS);
     } else {
       logToFile("callback_ignored.log", { status: normalized, raw: callbackData });
     }
@@ -288,21 +345,24 @@ setTimeout(() => pending.delete(ref), 600000);
   res.json({ success: true });
 });
 
-// === status route used by frontend (returns normalized) ===
+// === status route used by frontend (returns normalized + airtime + amount/mobile consistently) ===
 app.get("/api/status/:reference", async (req, res) => {
   const { reference } = req.params;
-  // if it's in pending map, return that status
-  if (pending.has(reference)) {
-  const entry = pending.get(reference);
-  return res.json({
-    success: true,
-    status: entry.status || "pending",    // PayNecta payment status
-    airtime: entry.airtime || "pending",  // Statum airtime delivery status
-    reference
-  });
-}
 
-  // otherwise query PayNecta once
+  // if it's in pending map, return that status (most complete source)
+  if (pending.has(reference)) {
+    const entry = pending.get(reference);
+    return res.json({
+      success: true,
+      status: entry.status || "pending",    // PayNecta payment status
+      airtime: entry.airtime || "pending",  // Statum airtime delivery status
+      reference,
+      amount: entry.amount || null,
+      mobile: entry.mobile || null
+    });
+  }
+
+  // otherwise query PayNecta once and synthesize a consistent response (include airtime assumption)
   try {
     const response = await axios.get(
       `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(reference)}`,
@@ -310,16 +370,34 @@ app.get("/api/status/:reference", async (req, res) => {
     );
     const payStatus = response.data;
     logToFile("paynecta_status.log", { reference, payStatus });
+
     const rawStatus = payStatus?.data?.status || payStatus?.status;
-let normalized = normalizeStatus(rawStatus);
+    let normalized = normalizeStatus(rawStatus);
 
-// ✅ fallback: if no status text but status_code=200, mark success
-if ((!rawStatus || normalized === "pending") &&
-    (payStatus?.data?.status_code === 200 || payStatus?.status_code === 200)) {
-  normalized = "success";
-}
+    // fallback: if no status text but status_code=200, mark success
+    if ((!rawStatus || normalized === "pending") &&
+        (payStatus?.data?.status_code === 200 || payStatus?.status_code === 200)) {
+      normalized = "success";
+    }
 
-return res.json({ success: true, status: normalized, reference, raw: payStatus });
+    // derive amount/mobile if available
+    const amount = payStatus?.data?.amount || payStatus?.amount || null;
+    const mobile = payStatus?.data?.mobile_number || payStatus?.data?.msisdn || payStatus?.mobile_number || null;
+
+    // synthesize airtime field: if payment success => assume airtime delivered (or at least allow frontend to show receipt)
+    let airtime = "pending";
+    if (normalized === "success") airtime = "success";
+    if (["failed", "cancelled"].includes(normalized)) airtime = "failed";
+
+    return res.json({
+      success: true,
+      status: normalized,
+      airtime,
+      reference,
+      amount,
+      mobile,
+      raw: payStatus
+    });
   } catch (err) {
     console.error("❌ Status lookup error:", err?.response?.data || err?.message || err);
     return res.status(500).json({ success: false, message: "Failed to check status", error: err?.response?.data || err?.message });
@@ -330,7 +408,7 @@ return res.json({ success: true, status: normalized, reference, raw: payStatus }
 app.get("/pending", (req, res) => {
   const arr = [];
   for (const [k, v] of pending.entries()) {
-    arr.push({ reference: k, mobile: v.mobile, amount: v.amount, attempts: v.attempts, status: v.status, startedAt: v.startedAt });
+    arr.push({ reference: k, mobile: v.mobile, amount: v.amount, attempts: v.attempts, status: v.status, airtime: v.airtime, startedAt: v.startedAt });
   }
   res.json({ success: true, pending: arr });
 });
