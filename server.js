@@ -1,4 +1,4 @@
-// server.js (simplified for Statum-first receipts)
+// server.js (Statum-first receipts + Paycenta status)
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://flourishing-baklava-324969.netlify.app" })); // change to your frontend in prod
+app.use(cors({ origin: "https://tourmaline-pegasus-b609ac.netlify.app" })); // change to your frontend in prod
 
 // ===== Replace with real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -93,8 +93,10 @@ async function pollTransaction(ref) {
     const payStatus = resp.data;
     const rawStatus = payStatus?.data?.status || payStatus?.status;
     const normalized = normalizeStatus(rawStatus);
+
     entry.attempts = (entry.attempts || 0) + 1;
     entry.status = normalized;
+    entry.paycentaResult = payStatus; // ✅ store full Paycenta response
 
     if (normalized === "success" && !entry.processed) {
       entry.processed = true;
@@ -155,6 +157,7 @@ app.post("/purchase", async (req, res) => {
         status: "pending",
         processed: false,
         airtime: "pending",
+        paycentaResult: null,
         statumResult: null,
         intervalId: setInterval(() => pollTransaction(transaction_reference), POLL_INTERVAL_MS),
         startedAt: Date.now()
@@ -169,28 +172,24 @@ app.post("/purchase", async (req, res) => {
   }
 });
 
-// === Status endpoint: return Statum receipt if available ===
+// === Status endpoint: return both Paycenta + Statum results ===
 app.get("/api/status/:reference", (req, res) => {
   const { reference } = req.params;
   if (pending.has(reference)) {
     const entry = pending.get(reference);
 
-    if (entry.statumResult) {
-      return res.json({
-        success: true,
-        reference,
-        mobile: entry.mobile,
-        amount: entry.amount,
-        airtime: entry.airtime,
-        statum: entry.statumResult
-      });
-    }
-
     return res.json({
       success: true,
       reference,
-      status: entry.status,
-      airtime: entry.airtime
+      mobile: entry.mobile,
+      amount: entry.amount,
+      airtime: entry.airtime,
+      paycenta: {
+        status: entry.status,
+        attempts: entry.attempts,
+        raw: entry.paycentaResult || null
+      },
+      statum: entry.statumResult || null
     });
   }
   res.json({ success: false, message: "Reference not found" });
