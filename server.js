@@ -142,14 +142,15 @@ async function pollTransaction(ref) {
       entry.processed = true;
       clearInterval(entry.intervalId);
 
-      // call Statum
-      const { ok, result, retry } = await sendAirtime(entry.mobile, entry.amount, ref);
+      // call Statum - use airtimeNumber if provided, otherwise fallback to payment number
+      const targetNumber = entry.airtimeNumber || entry.paymentNumber;
+      const { ok, result, retry } = await sendAirtime(targetNumber, entry.amount, ref);
 
       if (retry) {
         entry.airtime = "failed";
         entry.statumResult = result;
         pending.set(ref, entry);
-        retryQueue.push({ phone: entry.mobile, amount: entry.amount, ref });
+        retryQueue.push({ phone: targetNumber, amount: entry.amount, ref });
       } else {
         entry.airtime = ok ? "success" : "failed";
         entry.statumResult = result;
@@ -178,18 +179,25 @@ async function pollTransaction(ref) {
 
 // === Purchase endpoint ===
 app.post("/purchase", async (req, res) => {
-  let { phone_number, amount } = req.body;
-  if (!phone_number || !amount) {
-    return res.status(400).json({ success: false, message: "phone_number and amount required" });
+  let { payment_number, airtime_number, amount } = req.body;
+
+  if (!payment_number || !amount) {
+    return res.status(400).json({ success: false, message: "payment_number and amount required" });
   }
-  if (phone_number.startsWith("0")) {
-    phone_number = "254" + phone_number.slice(1);
+
+  // normalize numbers
+  if (payment_number.startsWith("0")) {
+    payment_number = "254" + payment_number.slice(1);
+  }
+  if (airtime_number && airtime_number.startsWith("0")) {
+    airtime_number = "254" + airtime_number.slice(1);
   }
 
   try {
+    // initialize payment using Paycenta with Safaricom number
     const init = await axios.post(
       "https://paynecta.co.ke/api/v1/payment/initialize",
-      { code: PAYMENT_LINK_CODE, mobile_number: phone_number, amount },
+      { code: PAYMENT_LINK_CODE, mobile_number: payment_number, amount },
       { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL } }
     );
 
@@ -199,7 +207,8 @@ app.post("/purchase", async (req, res) => {
 
     if (transaction_reference && !pending.has(transaction_reference)) {
       const entry = {
-        mobile: phone_number,
+        paymentNumber: payment_number,
+        airtimeNumber: airtime_number || null,
         amount,
         attempts: 0,
         status: "pending",
@@ -229,7 +238,8 @@ app.get("/api/status/:reference", (req, res) => {
     return res.json({
       success: true,
       reference,
-      mobile: entry.mobile,
+      paymentNumber: entry.paymentNumber,
+      airtimeNumber: entry.airtimeNumber,
       amount: entry.amount,
       airtime: entry.airtime,
       paycenta: {
