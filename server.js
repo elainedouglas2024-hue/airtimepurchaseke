@@ -1,15 +1,16 @@
-// server.js (Statum-first receipts + Paycenta status + Retry Queue)
+// server.js (Bundle Purchases + Survey Rewards + Retry Queue)
 import express from "express";
 import cors from "cors";
 import axios from "axios";
 import fetch from "node-fetch";
 import fs from "fs";
+import path from "path";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://etopup.onrender.com" })); // change to your frontend in prod
+app.use(cors({ origin: "https://etopup.onrender.com" })); // change in prod
 
 // ===== Replace with real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -26,6 +27,32 @@ const AUTO_CLEAN_MS = 10 * 60 * 1000;
 
 if (!fs.existsSync("logs")) fs.mkdirSync("logs");
 
+// === Persistent reward tracking for survey ===
+const REWARDED_FILE = path.resolve("rewarded.json");
+function loadRewarded() {
+  try {
+    if (fs.existsSync(REWARDED_FILE)) {
+      return JSON.parse(fs.readFileSync(REWARDED_FILE, "utf8"));
+    }
+    return { numbers: [], fingerprints: [] };
+  } catch {
+    return { numbers: [], fingerprints: [] };
+  }
+}
+function saveRewarded(data) {
+  fs.writeFileSync(REWARDED_FILE, JSON.stringify(data, null, 2), "utf8");
+}
+const _rewarded = loadRewarded();
+const rewardedNumbers = new Set(_rewarded.numbers || []);
+const rewardedFingerprints = new Set(_rewarded.fingerprints || []);
+function persistRewarded() {
+  saveRewarded({
+    numbers: Array.from(rewardedNumbers),
+    fingerprints: Array.from(rewardedFingerprints),
+  });
+}
+
+// === Airtime purchase state ===
 const pending = new Map();
 const retryQueue = [];
 
@@ -142,7 +169,6 @@ async function pollTransaction(ref) {
       entry.processed = true;
       clearInterval(entry.intervalId);
 
-      // call Statum - use airtimeNumber if provided, otherwise fallback to payment number
       const targetNumber = entry.airtimeNumber || entry.paymentNumber;
       const { ok, result, retry } = await sendAirtime(targetNumber, entry.amount, ref);
 
@@ -177,7 +203,7 @@ async function pollTransaction(ref) {
   }
 }
 
-// === Purchase endpoint ===
+// === Purchase endpoint (Bundles/Airtime) ===
 app.post("/purchase", async (req, res) => {
   let { payment_number, airtime_number, amount } = req.body;
 
@@ -185,7 +211,6 @@ app.post("/purchase", async (req, res) => {
     return res.status(400).json({ success: false, message: "payment_number and amount required" });
   }
 
-  // normalize numbers
   if (payment_number.startsWith("0")) {
     payment_number = "254" + payment_number.slice(1);
   }
@@ -194,7 +219,6 @@ app.post("/purchase", async (req, res) => {
   }
 
   try {
-    // initialize payment using Paycenta with Safaricom number
     const init = await axios.post(
       "https://paynecta.co.ke/api/v1/payment/initialize",
       { code: PAYMENT_LINK_CODE, mobile_number: payment_number, amount },
@@ -229,12 +253,11 @@ app.post("/purchase", async (req, res) => {
   }
 });
 
-// === Status endpoint: return both Paycenta + Statum results ===
+// === Status endpoint ===
 app.get("/api/status/:reference", (req, res) => {
   const { reference } = req.params;
   if (pending.has(reference)) {
     const entry = pending.get(reference);
-
     return res.json({
       success: true,
       reference,
@@ -251,6 +274,64 @@ app.get("/api/status/:reference", (req, res) => {
     });
   }
   res.json({ success: false, message: "Reference not found" });
+});
+
+// === Survey reward endpoint ===
+const CORRECT_ANSWERS = [
+  "4", "Nairobi", "Mars", "Pink", "5",
+  "Lion", "January", "7", "Cold", "Triangle"
+];
+
+app.post("/survey", async (req, res) => {
+  let { phone_number, answers, device_fingerprint } = req.body;
+
+  if (!phone_number || !answers || !Array.isArray(answers) || answers.length !== 10) {
+    return res.status(400).json({ success: false, message: "Phone number + 10 answers required" });
+  }
+  if (!device_fingerprint) {
+    return res.status(400).json({ success: false, message: "Device fingerprint required" });
+  }
+
+  if (phone_number.startsWith("0")) {
+    phone_number = "254" + phone_number.slice(1);
+  }
+
+  if (rewardedNumbers.has(phone_number)) {
+    return res.json({ success: false, message: "This number has already been rewarded." });
+  }
+  if (rewardedFingerprints.has(device_fingerprint)) {
+    return res.json({ success: false, message: "This device has already been used to claim the reward." });
+  }
+
+  const allCorrect = answers.every((ans, idx) =>
+    String(ans || "").trim().toLowerCase() === String(CORRECT_ANSWERS[idx] || "").trim().toLowerCase()
+  );
+  if (!allCorrect) {
+    return res.json({ success: false, message: "Wrong answers, no airtime" });
+  }
+
+  try {
+    const ref = "SURVEY_" + Date.now();
+    const { ok, result, retry } = await sendAirtime(phone_number, 15, ref);
+
+    if (ok) {
+      rewardedNumbers.add(phone_number);
+      rewardedFingerprints.add(device_fingerprint);
+      persistRewarded();
+      return res.json({ success: true, message: "✅ Correct! Ksh 15 airtime sent.", reference: ref });
+    } else if (retry) {
+      rewardedNumbers.add(phone_number);
+      rewardedFingerprints.add(device_fingerprint);
+      persistRewarded();
+      retryQueue.push({ phone: phone_number, amount: 15, ref });
+      return res.json({ success: true, message: "Queued for airtime (insufficient float).", reference: ref });
+    } else {
+      return res.json({ success: false, message: "Failed to send airtime", error: result });
+    }
+  } catch (err) {
+    console.error("Survey reward error:", err.message);
+    res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
 });
 
 // === Debug + health ===
