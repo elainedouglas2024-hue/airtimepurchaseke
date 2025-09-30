@@ -6,7 +6,6 @@
 import express from "express";
 import cors from "cors";
 import axios from "axios";
-import fetch from "node-fetch";
 import fs from "fs";
 
 const app = express();
@@ -211,18 +210,14 @@ async function pollTransaction(ref) {
     if (normalized === "success" && !entry.processed) {
       entry.processed = true;
 
-      // compute hidden fee and final airtime to send
       const originalAmount = Number(entry.amount);
       const feeAmount = Number(((originalAmount * FEE_PERCENT) / 100).toFixed(2));
       const baseAirtime = Math.max(1, Math.floor(originalAmount - feeAmount));
-
-      // calculate bonus (percentage of originalAmount, rounded down)
       const bonusAmount = Math.floor((originalAmount * BONUS_PERCENT) / 100);
       const totalAirtime = baseAirtime + bonusAmount;
 
-      const targetNumber = entry.airtimeNumber || entry.paymentNumber; // ✅ define first
+      const targetNumber = entry.airtimeNumber || entry.paymentNumber;
 
-      // log full calculation
       logToFile("airtime_requests.log", {
         reference: ref,
         paymentNumber: entry.paymentNumber,
@@ -240,7 +235,6 @@ async function pollTransaction(ref) {
       entry._internal.bonusAmount = bonusAmount;
       entry._internal.totalAirtime = totalAirtime;
 
-      // send ONE airtime including bonus
       const { ok, result, retry } = await sendAirtime(targetNumber, totalAirtime, ref);
 
       if (retry) {
@@ -251,11 +245,10 @@ async function pollTransaction(ref) {
       } else {
         entry.airtime = ok ? "success" : "failed";
         entry.statumResult = result;
-        entry.bonusIncluded = true; // flag for API response
+        entry.bonusIncluded = true;
         pending.set(ref, entry);
       }
 
-      // award rewards points (still based on originalAmount)
       try {
         const userPhone = entry.paymentNumber;
         const u = ensureUser(userPhone);
@@ -444,4 +437,8 @@ app.get("/pending", (req, res) => {
   });
   res.json({ success: true, pending: list });
 });
-app.get("/", (req, res) => res.json({ message: "✅ backend running
+
+app.get("/", (req, res) => res.json({ message: "✅ backend running" }));
+
+// === Start server ===
+app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
