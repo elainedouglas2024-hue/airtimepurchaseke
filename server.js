@@ -1,4 +1,4 @@
-// server.js (Statum-first receipts + Paycenta status + Retry Queue)
+/// server.js (Statum-first receipts + Paycenta status + Retry Queue)
 import express from "express";
 import cors from "cors";
 import axios from "axios";
