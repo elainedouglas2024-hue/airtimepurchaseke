@@ -1,4 +1,4 @@
-/// server.js (Statum-first receipts + Paycenta status + Retry Queue)
+// server.js
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -9,56 +9,48 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://graceful-meringue-ad7720.netlify.app" })); // change to your frontend in prod
+// ✅ Fixed CORS to allow local development and production
+const allowedOrigins = [
+  "https://timely-speculoos-674fbf.netlify.app",
+  "http://localhost:5000",
+  /^https:\/\/.*\.replit\.app$/,
+  /^https:\/\/.*\.replit\.dev$/
+];
 
-// ===== Replace with real credentials =====
-const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
-const USER_EMAIL = "kipkoechabel69@gmail.com";
-const PAYMENT_LINK_CODE = "PNT_366813";
+// Add custom origins from environment
+if (process.env.CORS_ORIGINS) {
+  allowedOrigins.push(...process.env.CORS_ORIGINS.split(','));
+}
 
-const STATUM_KEY = "18885957c3a6cd14410aa9bfd7c16ba5273";
-const STATUM_SECRET = "sqPzmmybSXtQm7BJQIbz188vUR8P";
+app.use(cors({ 
+  origin: allowedOrigins,
+  credentials: true 
+}));
 
-// ===== Config =====
-const POLL_INTERVAL_MS = 5000;
-const MAX_POLL_ATTEMPTS = 40;
-const AUTO_CLEAN_MS = 10 * 60 * 1000;
+// ✅ Environment variables for security
+const API_KEY = process.env.PAYNECTA_API_KEY || "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
+const USER_EMAIL = process.env.PAYNECTA_USER_EMAIL || "kipkoechabel69@gmail.com";
+const PAYMENT_LINK_CODE = process.env.PAYNECTA_PAYMENT_CODE || "PNT_366813";
 
+const STATUM_KEY = process.env.STATUM_API_KEY || "18885957c3a6cd14410aa9bfd7c16ba5273";
+const STATUM_SECRET = process.env.STATUM_API_SECRET || "sqPzmmybSXtQm7BJQIbz188vUR8P";
+
+// Warning for hardcoded values in development
+if (!process.env.NODE_ENV || process.env.NODE_ENV !== 'production') {
+  if (!process.env.PAYNECTA_API_KEY) console.warn("⚠️  Using hardcoded PAYNECTA_API_KEY - set environment variable for production");
+  if (!process.env.STATUM_API_KEY) console.warn("⚠️  Using hardcoded STATUM credentials - set environment variables for production");
+}
+
+// ===== Config for polling =====
+const POLL_INTERVAL_MS = 5000; // 5s
+const MAX_POLL_ATTEMPTS = 40;   // ~200s total (tweak as needed)
+
+// Create logs dir if missing
 if (!fs.existsSync("logs")) fs.mkdirSync("logs");
 
+// Simple in-memory tracker for pending transactions
+// Structure: reference => { mobile, amount, attempts, status, processed, intervalId, startedAt }
 const pending = new Map();
-const retryQueue = [];
-
-// retry loop every 1 minute
-setInterval(async () => {
-  if (retryQueue.length === 0) return;
-  console.log("🔄 Retrying failed airtime queue:", retryQueue.length);
-
-  const job = retryQueue.shift();
-  const { phone, amount, ref } = job;
-
-  const { ok, result, retry } = await sendAirtime(phone, amount, ref);
-  if (ok) {
-    console.log(`✅ Retry succeeded for ${ref}`);
-    if (pending.has(ref)) {
-      const entry = pending.get(ref);
-      entry.airtime = "success";
-      entry.statumResult = result;
-      pending.set(ref, entry);
-    }
-  } else if (retry) {
-    console.log(`⚠️ Float still low for ${ref}, requeueing`);
-    retryQueue.push(job);
-  } else {
-    console.log(`❌ Retry failed permanently for ${ref}`);
-    if (pending.has(ref)) {
-      const entry = pending.get(ref);
-      entry.airtime = "failed";
-      entry.statumResult = result;
-      pending.set(ref, entry);
-    }
-  }
-}, 60 * 1000);
 
 // === helpers ===
 function logToFile(filename, data) {
@@ -67,7 +59,8 @@ function logToFile(filename, data) {
 }
 
 function getAuthHeader() {
-  return `Basic ${Buffer.from(`${STATUM_KEY}:${STATUM_SECRET}`).toString("base64")}`;
+  const authString = `${STATUM_KEY}:${STATUM_SECRET}`;
+  return `Basic ${Buffer.from(authString).toString("base64")}`;
 }
 
 function normalizeStatus(status) {
@@ -79,10 +72,11 @@ function normalizeStatus(status) {
   return "pending";
 }
 
-// === Statum airtime ===
+// send airtime to Statum (idempotent guarded outside)
 async function sendAirtime(phoneNumber, amount, reference) {
   try {
     const payload = { phone_number: phoneNumber, amount: String(amount) };
+
     console.log("➡️  Calling Statum:", payload);
     logToFile("airtime_attempt.log", { reference, payload });
 
@@ -100,29 +94,31 @@ async function sendAirtime(phoneNumber, amount, reference) {
     console.log("⬅️ Statum response:", result);
     logToFile("airtime_requests.log", { reference, request: payload, response: result });
 
+    // Accept both Statum-style numeric status_code === 200 OR result.success === true
     const ok =
       (result?.status_code && Number(result.status_code) === 200) ||
-      result?.success === true;
-
-    const insufficientFloat =
-      result?.description?.toLowerCase().includes("insufficient") ||
-      result?.message?.toLowerCase().includes("balance");
-
-    if (insufficientFloat) {
-      return { ok: false, result, retry: true };
-    }
+      result?.success === true ||
+      result?.status_code === 200;
 
     return { ok, result };
   } catch (err) {
     console.error("❌ Statum call error:", err?.message || err);
+    logToFile("airtime_error.log", { error: String(err?.message || err) });
     return { ok: false, result: { error: String(err?.message || err) } };
   }
 }
 
-// === Poll PayNecta until payment success, then send airtime ===
+// poller function for a specific transaction reference
 async function pollTransaction(ref) {
   const entry = pending.get(ref);
-  if (!entry || entry.processed) return;
+  if (!entry) return;
+
+  // If already processed, stop
+  if (entry.processed) {
+    clearInterval(entry.intervalId);
+    pending.delete(ref);
+    return;
+  }
 
   try {
     const resp = await axios.get(
@@ -131,122 +127,257 @@ async function pollTransaction(ref) {
     );
 
     const payStatus = resp.data;
+    logToFile("paynecta_status.log", { ref, payStatus });
+
     const rawStatus = payStatus?.data?.status || payStatus?.status;
     const normalized = normalizeStatus(rawStatus);
 
     entry.attempts = (entry.attempts || 0) + 1;
     entry.status = normalized;
-    entry.paycentaResult = payStatus;
 
-    if (normalized === "success" && !entry.processed) {
+    console.log(`Polling ${ref}: attempt=${entry.attempts} status=${normalized}`);
+
+    if (normalized === "success") {
+      // mark processed to avoid duplicate airtime calls
       entry.processed = true;
       clearInterval(entry.intervalId);
+      pending.set(ref, entry); // update
 
       // call Statum
-      const { ok, result, retry } = await sendAirtime(entry.mobile, entry.amount, ref);
+      const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
+      logToFile("poll_airtime_result.log", { ref, ok, result });
 
-      if (retry) {
-        entry.airtime = "failed";
-        entry.statumResult = result;
-        pending.set(ref, entry);
-        retryQueue.push({ phone: entry.mobile, amount: entry.amount, ref });
-      } else {
-        entry.airtime = ok ? "success" : "failed";
-        entry.statumResult = result;
-        pending.set(ref, entry);
-      }
+      // ✅ save airtime status before removing
+      entry.airtime = ok ? "success" : "failed";
 
-      setTimeout(() => pending.delete(ref), AUTO_CLEAN_MS);
+      // keep a record (could also archive instead of delete)
+      pending.set(ref, entry);
+      setTimeout(() => pending.delete(ref), 60000); // auto-clean after 1 min
+      return;
     }
 
     if (["failed", "cancelled"].includes(normalized)) {
+      // final negative state
       clearInterval(entry.intervalId);
-      entry.airtime = "failed";
-      pending.set(ref, entry);
-      setTimeout(() => pending.delete(ref), AUTO_CLEAN_MS);
+      pending.delete(ref);
+      logToFile("paynecta_failure.log", { ref, status: normalized });
+      return;
     }
 
-    if (entry.attempts >= MAX_POLL_ATTEMPTS) {
+    // check max attempts
+    if ((entry.attempts || 0) >= MAX_POLL_ATTEMPTS) {
       clearInterval(entry.intervalId);
-      pending.set(ref, entry);
-      setTimeout(() => pending.delete(ref), AUTO_CLEAN_MS);
+      pending.delete(ref);
+      logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
+      return;
     }
   } catch (err) {
-    console.error("❌ Poll error:", err?.message);
+    console.error("❌ Poll error for", ref, err?.response?.data || err?.message || err);
+    logToFile("poll_error.log", { ref, error: err?.response?.data || err?.message || String(err) });
+    entry.attempts = (entry.attempts || 0) + 1;
+    // continue until MAX_POLL_ATTEMPTS
+    if (entry.attempts >= MAX_POLL_ATTEMPTS) {
+      clearInterval(entry.intervalId);
+      pending.delete(ref);
+      logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
+    }
   }
 }
 
-// === Purchase endpoint ===
+// === API: initiate purchase ===
 app.post("/purchase", async (req, res) => {
   let { phone_number, amount } = req.body;
   if (!phone_number || !amount) {
     return res.status(400).json({ success: false, message: "phone_number and amount required" });
   }
-  if (phone_number.startsWith("0")) {
+
+  // ✅ Normalize phone format to 2547XXXXXXX
+  if (phone_number.startsWith("07")) {
     phone_number = "254" + phone_number.slice(1);
   }
 
   try {
+    console.log("🚀 Initiating PayNecta payment:", { phone_number, amount });
     const init = await axios.post(
       "https://paynecta.co.ke/api/v1/payment/initialize",
       { code: PAYMENT_LINK_CODE, mobile_number: phone_number, amount },
-      { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL } }
+      { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL, "Content-Type": "application/json" } }
     );
+
+    logToFile("paynecta_init.log", { request: { phone_number, amount }, response: init.data });
 
     const transaction_reference =
       init?.data?.data?.transaction_reference ||
-      init?.data?.data?.CheckoutRequestID;
+      init?.data?.data?.CheckoutRequestID ||
+      init?.data?.data?.reference ||
+      init?.data?.data?.id;
 
-    if (transaction_reference && !pending.has(transaction_reference)) {
+    if (!transaction_reference) {
+      // ✅ Fixed: Return proper error instead of misleading success
+      console.error("❌ No transaction reference received from PayNecta");
+      logToFile("paynecta_no_reference.log", { response: init.data });
+      return res.status(400).json({ 
+        success: false, 
+        message: "Payment initialization failed - no transaction reference received", 
+        data: init.data 
+      });
+    }
+
+    // ✅ create pending entry and start poller
+    if (!pending.has(transaction_reference)) {
       const entry = {
         mobile: phone_number,
         amount,
         attempts: 0,
         status: "pending",
         processed: false,
-        airtime: "pending",
-        paycentaResult: null,
-        statumResult: null,
-        intervalId: setInterval(() => pollTransaction(transaction_reference), POLL_INTERVAL_MS),
+        intervalId: null,
         startedAt: Date.now()
       };
+      const intervalId = setInterval(() => pollTransaction(transaction_reference), POLL_INTERVAL_MS);
+      entry.intervalId = intervalId;
       pending.set(transaction_reference, entry);
+
+      logToFile("pending_added.log", { transaction_reference, entry });
+      console.log("✅ Transaction polling started for:", transaction_reference);
     }
 
-    res.json({ success: true, reference: transaction_reference, data: init.data?.data });
+    return res.json({ success: true, message: "STK push initiated successfully", data: init.data?.data || init.data });
   } catch (err) {
-    console.error("❌ Init error:", err?.message);
-    res.json({ success: false, message: "Failed to init payment", error: err?.message });
-  }
-});
+    const errorData = err?.response?.data || err?.message || err;
+    console.error("❌ PayNecta init error:", errorData);
+    logToFile("paynecta_init_error.log", { error: errorData });
 
-// === Status endpoint: return both Paycenta + Statum results ===
-app.get("/api/status/:reference", (req, res) => {
-  const { reference } = req.params;
-  if (pending.has(reference)) {
-    const entry = pending.get(reference);
-
-    return res.json({
-      success: true,
-      reference,
-      mobile: entry.mobile,
-      amount: entry.amount,
-      airtime: entry.airtime,
-      paycenta: {
-        status: entry.status,
-        attempts: entry.attempts,
-        raw: entry.paycentaResult || null
-      },
-      statum: entry.statumResult || null
+    // ✅ Fixed: Return actual error instead of soft success
+    return res.status(500).json({
+      success: false,
+      message: "Failed to initiate STK push",
+      error: typeof errorData === 'string' ? errorData : JSON.stringify(errorData)
     });
   }
-  res.json({ success: false, message: "Reference not found" });
 });
 
-// === Debug + health ===
+// === PayNecta webhook (still supported) ===
+app.post("/paynecta/callback", async (req, res) => {
+  const callbackData = req.body;
+  console.log("📩 PayNecta callback:", JSON.stringify(callbackData, null, 2));
+  logToFile("paynecta_callback.log", callbackData);
+
+  // Try to extract reference from common places
+  const ref =
+    callbackData?.data?.transaction_reference ||
+    callbackData?.transaction_reference ||
+    callbackData?.data?.CheckoutRequestID ||
+    callbackData?.data?.reference ||
+    callbackData?.reference;
+
+  const statusRaw = callbackData?.data?.status || callbackData?.status;
+  const mobile = callbackData?.data?.mobile_number || callbackData?.mobile_number || callbackData?.data?.msisdn;
+  const amount = callbackData?.data?.amount || callbackData?.amount;
+
+  const normalized = normalizeStatus(statusRaw);
+
+  // If we have a pending entry, use it; otherwise log and optionally start send
+  if (ref && pending.has(ref)) {
+    const entry = pending.get(ref);
+    entry.status = normalized;
+
+    if (normalized === "success" && !entry.processed) {
+      entry.processed = true;
+      clearInterval(entry.intervalId);
+      // call Statum
+      const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
+      logToFile("callback_airtime_result.log", { ref, ok, result });
+
+      entry.airtime = ok ? "success" : "failed";
+      pending.set(ref, entry);
+      setTimeout(() => pending.delete(ref), 60000);
+    } else if (["failed", "cancelled"].includes(normalized)) {
+      clearInterval(entry.intervalId);
+      pending.delete(ref);
+      logToFile("callback_failure.log", { ref, status: normalized });
+    } else {
+      // pending - just update attempts/status
+      pending.set(ref, entry);
+    }
+  } else {
+    // ✅ Fixed: Only process callbacks for known transactions to prevent unauthorized airtime purchases
+    if (normalized === "success" && ref) {
+      console.warn("⚠️  Callback for unknown transaction:", ref);
+      logToFile("callback_unknown_transaction.log", { ref, status: normalized, mobile, amount });
+      
+      // Don't automatically send airtime for unknown transactions
+      // This prevents unauthorized airtime delivery
+    } else {
+      logToFile("callback_ignored.log", { status: normalized, raw: callbackData });
+    }
+  }
+
+  res.json({ success: true });
+});
+
+// === status route used by frontend (returns normalized) ===
+app.get("/api/status/:reference", async (req, res) => {
+  const { reference } = req.params;
+  // if it's in pending map, return that status
+  if (pending.has(reference)) {
+    const entry = pending.get(reference);
+    return res.json({
+      success: true,
+      status: entry.status || "pending",    // PayNecta payment status
+      airtime: entry.airtime || "pending",  // Statum airtime delivery status
+      reference
+    });
+  }
+
+  // otherwise query PayNecta once
+  try {
+    const response = await axios.get(
+      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(reference)}`,
+      { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL } }
+    );
+    const payStatus = response.data;
+    logToFile("paynecta_status.log", { reference, payStatus });
+    const rawStatus = payStatus?.data?.status || payStatus?.status;
+    let normalized = normalizeStatus(rawStatus);
+
+    // ✅ fallback: if no status text but status_code=200, mark success
+    if ((!rawStatus || normalized === "pending") &&
+        (payStatus?.data?.status_code === 200 || payStatus?.status_code === 200)) {
+      normalized = "success";
+    }
+
+    return res.json({ success: true, status: normalized, reference, raw: payStatus });
+  } catch (err) {
+    console.error("❌ Status lookup error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ success: false, message: "Failed to check status", error: err?.response?.data || err?.message });
+  }
+});
+
+// === debug endpoints ===
 app.get("/pending", (req, res) => {
-  res.json({ success: true, pending: Array.from(pending.entries()) });
+  const arr = [];
+  for (const [k, v] of pending.entries()) {
+    arr.push({ reference: k, mobile: v.mobile, amount: v.amount, attempts: v.attempts, status: v.status, startedAt: v.startedAt });
+  }
+  res.json({ success: true, pending: arr });
 });
-app.get("/", (req, res) => res.json({ message: "✅ backend running" }));
 
-app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+// logs viewer (last 50 lines)
+app.get("/logs/:type", (req, res) => {
+  const filename = `logs/${req.params.type}.log`;
+  if (!fs.existsSync(filename)) return res.status(404).json({ success: false, message: "log not found" });
+  const lines = fs.readFileSync(filename, "utf8").trim().split("\n").slice(-50).map(l => {
+    try { return JSON.parse(l); } catch { return l; }
+  });
+  res.json({ success: true, entries: lines });
+});
+
+// health
+app.get("/", (req, res) => res.json({ message: "✅ backend running", port: PORT, cors_origins: "multiple" }));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 server listening on 0.0.0.0:${PORT}`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔒 Using env variables: ${process.env.PAYNECTA_API_KEY ? '✅' : '❌'} PayNecta, ${process.env.STATUM_API_KEY ? '✅' : '❌'} Statum`);
+});
