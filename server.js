@@ -11,8 +11,8 @@ app.use(express.json());
 app.use(cors({ origin: "https://graceful-meringue-ad7720.netlify.app" })); // change in prod
 
 // ===== Statum credentials =====
-const STATUM_KEY = "18885957c3a6cd14410aa9bfd7c16ba5273";
-const STATUM_SECRET = "sqPzmmybSXtQm7BJQIbz188vUR8P";
+const STATUM_KEY = "1984d59c99f0139468bb333ef27d84f7b3e";
+const STATUM_SECRET = "AnJFlebXwm0AS4B1VLHR198Q9fI7";
 
 // ===== Config =====
 const AUTO_CLEAN_MS = 10 * 60 * 1000;
